@@ -15,17 +15,14 @@
 
 ![应届生自动投递脚本效果图](data/images/image.png)
 
+## 项目仓库
+
+- GitHub 仓库：[yingjiesheng_auto_apply](https://github.com/zhangyueping8385/yingjiesheng_auto_apply)
+
 ## 文件说明
 
 - 脚本文件：`yingjiesheng_auto_apply.user.js`
 - 说明文件：`README.md`
-
-## 发布信息建议
-
-- 建议脚本名称：`应届生搜索页自动投递助手`
-- 当前版本：`0.1.1`
-- 推荐一句话简介：
-  - `适用于应届生搜索结果页的自动投递脚本。手动登录和筛选后，可自动投递站内直投岗位，支持发布时间过滤和关键词相关性过滤。`
 
 ## 适用页面
 
@@ -74,6 +71,22 @@
 ### 方式二：从本地文件导入
 
 如果你的浏览器和 Tampermonkey 版本支持，也可以直接导入本地 `.user.js` 文件。
+
+## 油猴导入步骤演示
+
+### 步骤截图
+
+![油猴导入步骤图 1](data/images/image%20copy.png)
+
+![油猴导入步骤图 2](data/images/image%20copy%202.png)
+
+### 演示视频
+
+<video controls preload="metadata" width="100%" src="data/mp4/%E6%B2%B9%E7%8C%B4%E6%8F%92%E5%85%A5%E6%AD%A5%E9%AA%A4.mp4">
+  你的当前平台不支持直接播放该视频，请使用下方链接打开。
+</video>
+
+- 视频文件：[油猴插入步骤.mp4](data/mp4/%E6%B2%B9%E7%8C%B4%E6%8F%92%E5%85%A5%E6%AD%A5%E9%AA%A4.mp4)
 
 ## 使用说明
 
