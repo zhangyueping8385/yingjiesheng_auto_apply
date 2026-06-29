@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         应届生搜索页自动投递助手
 // @namespace    https://tampermonkey.net/
-// @version      0.1.1
-// @description  适用于应届生搜索结果页的自动投递脚本。手动登录和筛选后，可自动投递站内直投岗位，支持发布时间过滤和关键词相关性过滤。
+// @version      0.1.9
+// @description  适用于应届生搜索结果页、职位推荐页和实习页的自动投递脚本。手动登录和筛选后，可自动投递站内直投岗位，支持预检查、暂停继续、统计面板和位置记忆。
 // @author       xiaozhang
 // @match        https://q.yingjiesheng.com/jobs/search/*
 // @match        https://www.yingjiesheng.com/jobs/search/*
+// @match        https://q.yingjiesheng.com/pc/searchintention*
+// @match        https://q.yingjiesheng.com/pc/searchintern*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=yingjiesheng.com
 // @license      MIT
 // @grant        none
@@ -16,7 +18,7 @@
  * 应届生搜索页自动投递助手
  *
  * 脚本定位：
- * - 面向应届生搜索结果页的自动化辅助脚本；
+ * - 面向应届生搜索结果页、职位推荐页和实习页的自动化辅助脚本；
  * - 由用户手动完成登录、搜索和筛选后，再启动自动投递；
  * - 默认仅处理站内直投岗位，并静默跳过外链岗位。
  *
@@ -24,11 +26,11 @@
  * - 自动识别当前页可投递岗位；
  * - 自动点击“立即申请”并处理常见确认弹窗；
  * - 支持发布时间过滤；
- * - 支持关键词相关性过滤；
- * - 支持自动翻页、日志展示和本地保存面板设置。
+ * - 支持多关键词匹配模式切换；
+ * - 支持开始前预检查、暂停继续、实时统计、自动翻页、日志展示和本地保存面板设置。
  *
  * 使用说明：
- * 1. 打开应届生职位搜索结果页；
+ * 1. 打开应届生职位搜索结果页、职位推荐页或实习页；
  * 2. 手动完成登录和筛选条件设置；
  * 3. 在右侧控制面板中确认过滤项；
  * 4. 点击“开始”执行自动投递；
@@ -51,9 +53,17 @@
     const SUCCESS_TEXTS = ['投递成功', '已投递'];
     // 页面中用于标识“站内直投”的标签文本。
     const INTERNAL_FLAG_TEXT = '站内直投';
+    // 当前脚本支持自动投递的页面路径。
+    const SUPPORTED_PAGE_PATTERNS = [
+        '/jobs/search/',
+        '/pc/searchintention',
+        '/pc/searchintern'
+    ];
 
     // 控制面板配置在本地存储中的键名，刷新页面后会自动恢复这些设置。
     const SETTINGS_STORAGE_KEY = 'yjs_auto_apply_settings_v1';
+    // 控制面板拖动位置在本地存储中的键名。
+    const PANEL_POSITION_STORAGE_KEY = 'yjs_auto_apply_panel_position_v1';
 
     // 关闭弹窗时沿用当前版本中的选择器，不主动回退或重置它们。
     const CLOSE_SELECTORS = [
@@ -86,19 +96,22 @@
     // silentSkipExternal: 外链岗位静默跳过，固定为 true，不再在界面中暴露开关。
     // filterOldJobs: 是否过滤发布时间超过阈值的岗位。
     // maxPublishDays: 发布时间过滤阈值，单位天。
-    // filterIrrelevantJobs: 是否过滤与关键词完全不相关的岗位。
-    // keywordText: 关键词过滤使用的关键词，默认读取当前搜索页关键词。
+    // filterIrrelevantJobs: 是否启用多关键词匹配。
+    // keywordText: 关键词匹配使用的文本，支持输入多个关键字。
+    // keywordMatchMode: 关键词匹配模式，any 表示命中任意一个，all 表示必须命中全部。
     const DEFAULT_SETTINGS = {
         onlyInternalDirect: true,
         silentSkipExternal: true,
         filterOldJobs: false,
         maxPublishDays: 30,
         filterIrrelevantJobs: false,
-        keywordText: ''
+        keywordText: '',
+        keywordMatchMode: 'any'
     };
 
     // 运行状态统一收口在一个对象里，便于后续维护与扩展。
     // running: 当前自动投递是否正在运行。
+    // paused: 当前自动投递是否处于暂停状态。
     // loopPromise: 主循环对应的 Promise，便于串联开始/停止。
     // seenJobs: 当前轮次已经处理过的职位去重集合。
     // observer: 页面 DOM 观察器，用于监听超限提示。
@@ -109,20 +122,31 @@
     // jobMetaCache: 职位详情页元信息缓存，避免重复抓取发布时间。
     // settings: 当前生效配置，会由默认值、本地存储和面板输入共同决定。
     // controls: 面板控件节点缓存，便于统一读写配置。
+    // statNodes: 面板统计节点引用。
+    // stats: 本轮实时统计信息。
     const state = {
         running: false,
+        paused: false,
         loopPromise: null,
         seenJobs: new Set(),
         observer: null,
         panel: null,
         statusNode: null,
         logNode: null,
+        pauseButton: null,
         logLines: [],
         applyingNow: false,
         openedNewWindow: false,
         jobMetaCache: new Map(),
         settings: { ...DEFAULT_SETTINGS },
-        controls: {}
+        controls: {},
+        statNodes: {},
+        stats: {
+            successCount: 0,
+            failedCount: 0,
+            skippedCount: 0,
+            currentPage: 1
+        }
     };
 
     // 从本地存储恢复上次保存的面板配置。
@@ -139,6 +163,7 @@
                 maxPublishDays: Math.max(1, Number(parsed.maxPublishDays) || DEFAULT_SETTINGS.maxPublishDays),
                 filterIrrelevantJobs: !!parsed.filterIrrelevantJobs,
                 keywordText: normalizeText(parsed.keywordText || ''),
+                keywordMatchMode: parsed.keywordMatchMode === 'all' ? 'all' : DEFAULT_SETTINGS.keywordMatchMode,
                 // 这两个能力仍然保留，但不再允许从界面或历史存储关闭。
                 onlyInternalDirect: true,
                 silentSkipExternal: true
@@ -155,10 +180,37 @@
                 filterOldJobs: !!settings.filterOldJobs,
                 maxPublishDays: Math.max(1, Number(settings.maxPublishDays) || DEFAULT_SETTINGS.maxPublishDays),
                 filterIrrelevantJobs: !!settings.filterIrrelevantJobs,
-                keywordText: normalizeText(settings.keywordText || '')
+                keywordText: normalizeText(settings.keywordText || ''),
+                keywordMatchMode: settings.keywordMatchMode === 'all' ? 'all' : DEFAULT_SETTINGS.keywordMatchMode
             }));
         } catch (error) {
             // 本地存储失败时不阻断主流程。
+        }
+    }
+
+    // 保存控制面板拖动后的位置，刷新页面后继续沿用。
+    function savePanelPosition(left, top) {
+        try {
+            window.localStorage.setItem(PANEL_POSITION_STORAGE_KEY, JSON.stringify({ left, top }));
+        } catch (error) {
+            // 本地存储失败时不阻断主流程。
+        }
+    }
+
+    // 从本地存储恢复控制面板位置。
+    function loadPanelPosition() {
+        try {
+            const raw = window.localStorage.getItem(PANEL_POSITION_STORAGE_KEY);
+            if (!raw) {
+                return null;
+            }
+            const parsed = JSON.parse(raw);
+            if (typeof parsed.left !== 'number' || typeof parsed.top !== 'number') {
+                return null;
+            }
+            return parsed;
+        } catch (error) {
+            return null;
         }
     }
 
@@ -236,6 +288,97 @@
         state.logNode.textContent = state.logLines.join('\n');
     }
 
+    // 从页面或 URL 中推断当前页码，统计栏会优先显示真实页码。
+    function detectCurrentPageNumber() {
+        const activeNode = document.querySelector('.el-pager .active, .el-pagination .active, .el-pagination .is-active, .pagination .active');
+        const activeText = normalizeText(activeNode ? activeNode.textContent : '');
+        const activeNumber = Number(activeText);
+        if (Number.isFinite(activeNumber) && activeNumber > 0) {
+            return activeNumber;
+        }
+
+        try {
+            const url = new URL(window.location.href);
+            const pageText = url.searchParams.get('page') || url.searchParams.get('pageNo') || url.searchParams.get('p') || '';
+            const pageNumber = Number(pageText);
+            if (Number.isFinite(pageNumber) && pageNumber > 0) {
+                return pageNumber;
+            }
+        } catch (error) {
+            // URL 解析失败时保持静默，回退到默认页码。
+        }
+
+        return 1;
+    }
+
+    // 刷新面板顶部的实时统计。
+    function updateStatsDisplay() {
+        const mapping = [
+            ['successCount', state.stats.successCount],
+            ['failedCount', state.stats.failedCount],
+            ['skippedCount', state.stats.skippedCount],
+            ['currentPage', state.stats.currentPage]
+        ];
+        mapping.forEach(([key, value]) => {
+            const node = state.statNodes[key];
+            if (node) {
+                node.textContent = String(value);
+            }
+        });
+    }
+
+    // 重置本轮统计，通常在用户点击开始或清空记录时调用。
+    function resetRuntimeStats() {
+        state.stats = {
+            successCount: 0,
+            failedCount: 0,
+            skippedCount: 0,
+            currentPage: detectCurrentPageNumber()
+        };
+        updateStatsDisplay();
+    }
+
+    // 设置当前页数统计。
+    function setCurrentPageStat(pageNumber) {
+        if (!Number.isFinite(pageNumber) || pageNumber <= 0) {
+            return;
+        }
+        state.stats.currentPage = pageNumber;
+        updateStatsDisplay();
+    }
+
+    // 累加某个统计项。
+    function incrementStat(key, amount) {
+        if (!Object.prototype.hasOwnProperty.call(state.stats, key)) {
+            return;
+        }
+        state.stats[key] += typeof amount === 'number' ? amount : 1;
+        updateStatsDisplay();
+    }
+
+    // 根据运行状态刷新“暂停/继续”按钮文案与可用状态。
+    function updatePauseButton() {
+        if (!state.pauseButton) {
+            return;
+        }
+        if (!state.running) {
+            state.pauseButton.textContent = '暂停';
+            state.pauseButton.disabled = true;
+            state.pauseButton.style.background = '#8c8c8c';
+            state.pauseButton.style.cursor = 'not-allowed';
+            return;
+        }
+        state.pauseButton.disabled = false;
+        state.pauseButton.style.cursor = 'pointer';
+        if (state.paused) {
+            state.pauseButton.textContent = '继续';
+            state.pauseButton.style.background = '#52c41a';
+            return;
+        }
+        state.pauseButton.textContent = '暂停';
+        state.pauseButton.style.background = '#faad14';
+    }
+
     // 停止自动投递，并同步刷新面板状态。
     function stopAutoApply(reason) {
         if (!state.running) {
@@ -246,21 +389,54 @@
             return;
         }
         state.running = false;
+        state.paused = false;
         updateStatus(reason || '已停止', '#ff4d4f');
+        updatePauseButton();
         log(reason || '自动投递已停止');
     }
 
-    // 判断当前页面是否仍在搜索结果页。
+    // 将自动投递切换为暂停状态。
+    function pauseAutoApply() {
+        if (!state.running || state.paused) {
+            return;
+        }
+        state.paused = true;
+        updateStatus('状态：已暂停', '#faad14');
+        updatePauseButton();
+        log('已暂停，等待继续');
+    }
+
+    // 从暂停状态恢复自动投递。
+    function resumeAutoApply() {
+        if (!state.running || !state.paused) {
+            return;
+        }
+        state.paused = false;
+        updateStatus('状态：运行中', '#52c41a');
+        updatePauseButton();
+        log('已继续自动投递');
+    }
+
+    // 在各个异步步骤之间等待暂停结束，避免暂停期间继续点击页面。
+    async function waitIfPaused() {
+        while (state.running && state.paused) {
+            await sleep(200);
+        }
+        return state.running;
+    }
+
+    // 判断当前页面是否属于脚本支持的岗位列表页。
     function ensureSearchPage() {
-        return window.location.href.includes('/jobs/search/');
+        const currentUrl = window.location.href;
+        return SUPPORTED_PAGE_PATTERNS.some((pattern) => currentUrl.includes(pattern));
     }
 
-    // 获取职位列表根节点。
+    // 获取职位列表根节点，兼容搜索结果页、职位推荐页和实习页。
     function getListRoot() {
-        return document.querySelector('#list');
+        return document.querySelector('#list, .search-list, .job-list, .list-content, .position-list');
     }
 
-    // 获取搜索结果页里用户当前输入的关键词。
+    // 获取当前岗位列表页里用户输入的关键词。
     function getSearchKeywordFromPage() {
         const url = new URL(window.location.href);
         const queryKeyword = normalizeText(
@@ -284,6 +460,7 @@
         }
 
         const keywordInput = state.controls.keywordText;
+        const keywordModeSelect = state.controls.keywordMatchMode;
         const fallbackKeyword = getSearchKeywordFromPage();
 
         state.settings = {
@@ -293,7 +470,8 @@
             filterOldJobs: !!(state.controls.filterOldJobs && state.controls.filterOldJobs.checked),
             maxPublishDays: Math.max(1, Number(state.controls.maxPublishDays ? state.controls.maxPublishDays.value : DEFAULT_SETTINGS.maxPublishDays) || DEFAULT_SETTINGS.maxPublishDays),
             filterIrrelevantJobs: !!(state.controls.filterIrrelevantJobs && state.controls.filterIrrelevantJobs.checked),
-            keywordText: normalizeText(keywordInput ? keywordInput.value : '') || fallbackKeyword
+            keywordText: normalizeText(keywordInput ? keywordInput.value : '') || fallbackKeyword,
+            keywordMatchMode: keywordModeSelect && keywordModeSelect.value === 'all' ? 'all' : DEFAULT_SETTINGS.keywordMatchMode
         };
 
         if (keywordInput && !normalizeText(keywordInput.value)) {
@@ -336,9 +514,16 @@
             || href.includes('zhaopin.com');
     }
 
-    // 优先定位搜索结果主列表的第一层包裹节点。
+    // 优先定位职位主列表的第一层包裹节点。
     function getPrimaryJobWrapper() {
-        return document.querySelector('#list > div:first-child');
+        const selectors = [
+            '#list > div:first-child',
+            '.search-list > div:first-child',
+            '.job-list > div:first-child',
+            '.list-content > div:first-child',
+            '.position-list > div:first-child'
+        ];
+        return selectors.map((selector) => document.querySelector(selector)).find(Boolean) || null;
     }
 
     // 收集当前页所有可见职位卡片。
@@ -635,60 +820,44 @@
         }
     }
 
-    // 生成关键词过滤所需的匹配词组，策略偏宽松，目标是过滤“完全无关”岗位。
+    // 将用户输入拆分成多个关键字，支持空格、逗号、顿号、分号、竖线等分隔符。
     function buildKeywordTerms(keywordText) {
-        const normalized = normalizeText(keywordText).toLowerCase();
+        const normalized = normalizeText(keywordText);
         if (!normalized) {
             return [];
         }
 
-        const terms = new Set();
-        terms.add(normalized);
-
-        normalized.split(/[\s,/|+，。；、\-]+/).forEach((part) => {
-            const token = normalizeText(part);
-            if (token.length >= 2) {
-                terms.add(token);
-            }
-        });
-
-        const chineseOnly = normalized.replace(/[^\u4e00-\u9fa5]/g, '');
-        if (chineseOnly.length >= 2) {
-            for (let i = 0; i < chineseOnly.length - 1; i += 1) {
-                terms.add(chineseOnly.slice(i, i + 2));
-            }
-            for (let i = 0; i < chineseOnly.length - 2; i += 1) {
-                terms.add(chineseOnly.slice(i, i + 3));
-            }
-        }
-
-        return Array.from(terms).filter((item) => item.length >= 2);
+        return Array.from(new Set(
+            normalized
+                .split(/[\s,/|+，。；、\-]+/)
+                .map((part) => normalizeText(part).toLowerCase())
+                .filter(Boolean)
+        ));
     }
 
-    // 判断职位与关键词是否相关，策略是“只过滤完全不相关”的岗位。
-    function isJobRelevantToKeyword(card, keywordText) {
-        const normalizedKeyword = normalizeText(keywordText);
-        if (!normalizedKeyword) {
-            return true;
-        }
-
-        const cardText = normalizeText(card.innerText || '').toLowerCase();
-        const fullKeyword = normalizedKeyword.toLowerCase();
-        if (cardText.includes(fullKeyword)) {
-            return true;
-        }
-
-        const terms = buildKeywordTerms(fullKeyword);
+    // 根据配置判断岗位文本是否命中关键字，支持“任意一个”与“全部命中”两种模式。
+    function doesJobMatchKeywordTerms(card, keywordText, matchMode) {
+        const terms = buildKeywordTerms(keywordText);
         if (terms.length === 0) {
             return true;
         }
 
+        const cardText = normalizeText(card.innerText || '').toLowerCase();
+        if (matchMode === 'all') {
+            return terms.every((term) => cardText.includes(term));
+        }
         return terms.some((term) => cardText.includes(term));
     }
 
+    // 将关键字匹配模式转成用户可读文本。
+    function getKeywordMatchModeLabel(matchMode) {
+        return matchMode === 'all' ? '必须命中全部' : '命中任意一个';
+    }
+
     // 根据面板配置对候选职位做最终过滤。
-    async function filterCandidates(candidates) {
-        const settings = syncSettingsFromPanel();
+    async function filterCandidates(candidates, options) {
+        const settings = options && options.settings ? options.settings : syncSettingsFromPanel();
+        const logSummary = !options || options.logSummary !== false;
         const filtered = [];
         const stats = {
             source: candidates.length,
@@ -712,7 +881,7 @@
                 }
             }
 
-            if (settings.filterIrrelevantJobs && !isJobRelevantToKeyword(item.card, settings.keywordText)) {
+            if (settings.filterIrrelevantJobs && !doesJobMatchKeywordTerms(item.card, settings.keywordText, settings.keywordMatchMode)) {
                 stats.keywordRemoved += 1;
                 continue;
             }
@@ -720,11 +889,38 @@
             filtered.push(item);
         }
 
-        if (stats.internalRemoved || stats.ageRemoved || stats.keywordRemoved) {
-            log(`过滤结果: 原始${stats.source}个, 站内过滤${stats.internalRemoved}个, 时效过滤${stats.ageRemoved}个, 相关性过滤${stats.keywordRemoved}个, 保留${filtered.length}个`);
+        if (logSummary && (stats.internalRemoved || stats.ageRemoved || stats.keywordRemoved)) {
+            log(`过滤结果: 原始${stats.source}个, 站内过滤${stats.internalRemoved}个, 时效过滤${stats.ageRemoved}个, 关键词过滤${stats.keywordRemoved}个, 保留${filtered.length}个`);
         }
 
         return filtered;
+    }
+
+    // 在正式开始前先做一次页面预检查，帮助用户确认当前配置是否符合预期。
+    async function runPrecheck() {
+        const settings = syncSettingsFromPanel();
+        const cards = getJobCards();
+        const rawCandidates = getApplyCandidates();
+        const filteredCandidates = await filterCandidates(rawCandidates, { settings, logSummary: false });
+        const internalCandidates = rawCandidates.filter((item) => item.isInternal);
+        const previewLines = [
+            `预检查: 卡片${cards.length}个, 可申请${rawCandidates.length}个, 站内直投${internalCandidates.length}个, 预计投递${filteredCandidates.length}个`
+        ];
+
+        if (settings.filterOldJobs) {
+            previewLines.push(`预检查配置: 发布时间不超过 ${settings.maxPublishDays} 天`);
+        }
+        if (settings.filterIrrelevantJobs) {
+            const keywordText = settings.keywordText || getSearchKeywordFromPage() || '未填写';
+            previewLines.push(`预检查配置: 关键字匹配=${getKeywordMatchModeLabel(settings.keywordMatchMode)}, 关键字=${keywordText}`);
+        }
+        previewLines.forEach((line) => log(line));
+        return {
+            cards: cards.length,
+            rawCandidates: rawCandidates.length,
+            internalCandidates: internalCandidates.length,
+            filteredCandidates: filteredCandidates.length
+        };
     }
 
     // 拦截站点可能打开的新标签页，并标记为外链岗位。
@@ -801,6 +997,9 @@
             if (!state.running) {
                 return;
             }
+            if (!await waitIfPaused()) {
+                return;
+            }
             if (hasDailyLimit()) {
                 stopAutoApply(`检测到提示：${DAILY_LIMIT_TEXT}`);
                 return;
@@ -835,6 +1034,9 @@
     async function waitForApplyResult(element, timeoutMs) {
         const start = Date.now();
         while (Date.now() - start < timeoutMs) {
+            if (!await waitIfPaused()) {
+                return 'stopped';
+            }
             if (hasDailyLimit()) {
                 return 'daily_limit';
             }
@@ -859,6 +1061,9 @@
         state.openedNewWindow = false;
 
         try {
+            if (!await waitIfPaused()) {
+                return { jobTitle, result: 'stopped' };
+            }
             const clicked = safeClick(item.element);
             if (!clicked) {
                 return { jobTitle, result: 'failed' };
@@ -906,6 +1111,9 @@
 
         const start = Date.now();
         while (Date.now() - start < PAGE_CHANGE_TIMEOUT_MS) {
+            if (!await waitIfPaused()) {
+                return false;
+            }
             if (!state.running) {
                 return false;
             }
@@ -916,6 +1124,12 @@
             await sleep(500);
             const currentSignature = getListSignature();
             if (currentSignature && currentSignature !== beforeSignature) {
+                const pageNumber = detectCurrentPageNumber();
+                if (pageNumber > state.stats.currentPage) {
+                    setCurrentPageStat(pageNumber);
+                } else {
+                    setCurrentPageStat(state.stats.currentPage + 1);
+                }
                 log('下一页加载完成');
                 return true;
             }
@@ -928,10 +1142,14 @@
     // 自动投递主循环：收集候选、执行过滤、逐个投递、最后翻页。
     async function autoApplyLoop() {
         while (state.running) {
-            if (!ensureSearchPage()) {
-                stopAutoApply('当前不在搜索结果页，请回到职位搜索结果页后再开始');
+            if (!await waitIfPaused()) {
                 break;
             }
+            if (!ensureSearchPage()) {
+                stopAutoApply('当前不在支持的岗位列表页，请回到搜索结果页、职位推荐页或实习页后再开始');
+                break;
+            }
+            setCurrentPageStat(detectCurrentPageNumber() || state.stats.currentPage);
 
             if (hasDailyLimit()) {
                 stopAutoApply(`检测到提示：${DAILY_LIMIT_TEXT}`);
@@ -939,7 +1157,8 @@
             }
 
             const rawCandidates = getApplyCandidates();
-            const candidates = await filterCandidates(rawCandidates);
+            const currentSettings = syncSettingsFromPanel();
+            const candidates = await filterCandidates(rawCandidates, { settings: currentSettings });
             if (candidates.length === 0) {
                 log('当前页未找到可投递职位，准备尝试下一页');
                 const moved = await goToNextPage();
@@ -953,6 +1172,9 @@
             log(`当前页找到 ${candidates.length} 个待投递职位`);
 
             for (const item of candidates) {
+                if (!await waitIfPaused()) {
+                    break;
+                }
                 if (!state.running) {
                     break;
                 }
@@ -970,12 +1192,14 @@
                 }
 
                 if (result === 'external' && state.settings.silentSkipExternal) {
+                    incrementStat('skippedCount');
                     closeVisibleDialogs();
                     await sleep(POST_DIALOG_CLOSE_WAIT_MS);
                     continue;
                 }
 
                 const ok = result === 'success';
+                incrementStat(ok ? 'successCount' : 'failedCount');
                 log(`${ok ? '投递成功' : '投递失败'}: ${jobTitle}`);
 
                 closeVisibleDialogs();
@@ -1032,11 +1256,28 @@
             const handleUp = () => {
                 document.removeEventListener('mousemove', handleMove);
                 document.removeEventListener('mouseup', handleUp);
+                const latestRect = panel.getBoundingClientRect();
+                savePanelPosition(latestRect.left, latestRect.top);
             };
 
             document.addEventListener('mousemove', handleMove);
             document.addEventListener('mouseup', handleUp, { once: true });
         });
+    }
+
+    // 恢复控制面板上次拖动后的位置，避免每次刷新都要重新摆放。
+    function restorePanelPosition(panel) {
+        const position = loadPanelPosition();
+        if (!position) {
+            return;
+        }
+        const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth - 8);
+        const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight - 8);
+        const left = Math.min(Math.max(0, position.left), maxLeft);
+        const top = Math.min(Math.max(0, position.top), maxTop);
+        panel.style.left = `${left}px`;
+        panel.style.top = `${top}px`;
+        panel.style.right = 'auto';
     }
 
     // 将面板控件节点缓存起来，便于后续读取配置。
@@ -1045,7 +1286,9 @@
             filterOldJobs: panel.querySelector('#yjs-filter-old'),
             maxPublishDays: panel.querySelector('#yjs-max-days'),
             filterIrrelevantJobs: panel.querySelector('#yjs-filter-keyword'),
-            keywordText: panel.querySelector('#yjs-keyword-text')
+            keywordText: panel.querySelector('#yjs-keyword-text'),
+            keywordMatchMode: panel.querySelector('#yjs-keyword-mode'),
+            keywordModeHint: panel.querySelector('#yjs-keyword-mode-hint')
         };
 
         const storedSettings = loadSettingsFromStorage();
@@ -1063,11 +1306,15 @@
         if (state.controls.keywordText) {
             state.controls.keywordText.value = state.settings.keywordText || '';
         }
+        if (state.controls.keywordMatchMode) {
+            state.controls.keywordMatchMode.value = state.settings.keywordMatchMode || DEFAULT_SETTINGS.keywordMatchMode;
+        }
 
         const fallbackKeyword = getSearchKeywordFromPage();
         if (state.controls.keywordText) {
             state.controls.keywordText.placeholder = fallbackKeyword || '默认读取当前搜索关键词';
         }
+        updateKeywordModeHint();
 
         Object.values(state.controls).forEach((control) => {
             if (control) {
@@ -1077,6 +1324,35 @@
         });
 
         syncSettingsFromPanel();
+    }
+
+    // 根据关键字匹配模式切换提示文案，避免严格模式下用户误以为候选数量异常。
+    function updateKeywordModeHint() {
+        if (!state.controls || !state.controls.keywordModeHint) {
+            return;
+        }
+        const mode = state.controls.keywordMatchMode ? state.controls.keywordMatchMode.value : DEFAULT_SETTINGS.keywordMatchMode;
+        if (mode === 'all') {
+            state.controls.keywordModeHint.textContent = '当前模式较严格：岗位文本需要同时命中全部关键字，候选数量可能明显减少。';
+            state.controls.keywordModeHint.style.display = 'block';
+            return;
+        }
+        state.controls.keywordModeHint.textContent = '';
+        state.controls.keywordModeHint.style.display = 'none';
+    }
+
+    // 点击按钮后给一个短暂的视觉反馈，避免用户不确定是否已经触发。
+    function flashButtonFeedback(button) {
+        if (!button) {
+            return;
+        }
+        button.classList.remove('yjs-button-feedback');
+        // 强制重排，确保连续点击时动画可重复触发。
+        void button.offsetWidth;
+        button.classList.add('yjs-button-feedback');
+        window.setTimeout(() => {
+            button.classList.remove('yjs-button-feedback');
+        }, 220);
     }
 
     // 创建控制面板，并将过滤项暴露给用户手动切换。
@@ -1090,8 +1366,15 @@
         panel.innerHTML = `
             <div id="yjs-auto-apply-title">应届生自动投递</div>
             <div id="yjs-auto-apply-status">状态：待开始</div>
+            <div id="yjs-auto-apply-stats">
+                <div class="yjs-stat-card"><span class="yjs-stat-label">成功</span><strong id="yjs-stat-success">0</strong></div>
+                <div class="yjs-stat-card"><span class="yjs-stat-label">失败</span><strong id="yjs-stat-failed">0</strong></div>
+                <div class="yjs-stat-card"><span class="yjs-stat-label">跳过</span><strong id="yjs-stat-skipped">0</strong></div>
+                <div class="yjs-stat-card"><span class="yjs-stat-label">当前页</span><strong id="yjs-stat-page">1</strong></div>
+            </div>
             <div id="yjs-auto-apply-actions">
                 <button id="yjs-auto-apply-start" type="button">开始</button>
+                <button id="yjs-auto-apply-pause" type="button">暂停</button>
                 <button id="yjs-auto-apply-stop" type="button">停止</button>
                 <button id="yjs-auto-apply-clear" type="button">清空记录</button>
             </div>
@@ -1101,8 +1384,16 @@
                     <input id="yjs-max-days" type="number" min="1" value="30">
                     <span>天</span>
                 </div>
-                <label><input id="yjs-filter-keyword" type="checkbox"> 过滤与关键词完全不相关岗位</label>
-                <input id="yjs-keyword-text" type="text" placeholder="默认读取当前搜索关键词">
+                <label><input id="yjs-filter-keyword" type="checkbox"> 启用关键字匹配</label>
+                <div class="yjs-filter-row">
+                    <span>匹配模式</span>
+                    <select id="yjs-keyword-mode">
+                        <option value="any">命中任意一个</option>
+                        <option value="all">必须命中全部</option>
+                    </select>
+                </div>
+                <div id="yjs-keyword-mode-hint"></div>
+                <input id="yjs-keyword-text" type="text" placeholder="多个关键字可用空格、逗号或顿号分隔">
             </div>
             <div id="yjs-auto-apply-tips">先手动登录、搜索岗位、设置筛选条件，再点击开始。</div>
             <pre id="yjs-auto-apply-log"></pre>
@@ -1135,6 +1426,30 @@
                 margin-bottom: 10px;
                 color: #69b1ff;
             }
+            #yjs-auto-apply-stats {
+                display: grid;
+                grid-template-columns: repeat(4, minmax(0, 1fr));
+                gap: 8px;
+                margin-bottom: 10px;
+            }
+            .yjs-stat-card {
+                background: rgba(255, 255, 255, 0.06);
+                border-radius: 8px;
+                padding: 8px 6px;
+                text-align: center;
+            }
+            .yjs-stat-label {
+                display: block;
+                font-size: 12px;
+                color: #d9d9d9;
+                margin-bottom: 4px;
+            }
+            .yjs-stat-card strong {
+                display: block;
+                font-size: 16px;
+                color: #f5f7fa;
+                line-height: 1.2;
+            }
             #yjs-auto-apply-actions {
                 display: flex;
                 gap: 8px;
@@ -1143,10 +1458,32 @@
             #yjs-auto-apply-actions button {
                 flex: 1;
                 border: 0;
-                border-radius: 8px;
-                padding: 8px 10px;
+                border-radius: 7px;
+                padding: 6px 8px;
                 cursor: pointer;
                 font-weight: 600;
+                font-size: 12px;
+                line-height: 1.2;
+                transition: transform 0.12s ease, filter 0.12s ease, box-shadow 0.16s ease, opacity 0.16s ease;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.22);
+            }
+            #yjs-auto-apply-actions button:hover {
+                filter: brightness(1.08);
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
+            }
+            #yjs-auto-apply-actions button:active,
+            #yjs-auto-apply-actions button.yjs-button-feedback {
+                transform: translateY(1px) scale(0.98);
+                filter: brightness(0.92);
+                box-shadow: 0 1px 4px rgba(0, 0, 0, 0.22);
+            }
+            #yjs-auto-apply-actions button:disabled {
+                opacity: 0.6;
+                box-shadow: none;
+            }
+            #yjs-auto-apply-actions button:focus-visible {
+                outline: 2px solid rgba(255, 255, 255, 0.72);
+                outline-offset: 1px;
             }
             #yjs-auto-apply-start {
                 background: #1677ff;
@@ -1154,6 +1491,10 @@
             }
             #yjs-auto-apply-stop {
                 background: #ff7875;
+                color: #ffffff;
+            }
+            #yjs-auto-apply-pause {
+                background: #faad14;
                 color: #ffffff;
             }
             #yjs-auto-apply-clear {
@@ -1182,6 +1523,7 @@
                 font-size: 13px;
             }
             #yjs-max-days,
+            #yjs-keyword-mode,
             #yjs-keyword-text {
                 border: 1px solid rgba(255, 255, 255, 0.15);
                 border-radius: 6px;
@@ -1193,9 +1535,22 @@
             #yjs-max-days {
                 width: 56px;
             }
+            #yjs-keyword-mode {
+                flex: 1;
+            }
             #yjs-keyword-text {
                 width: 100%;
                 box-sizing: border-box;
+            }
+            #yjs-keyword-mode-hint {
+                display: none;
+                font-size: 12px;
+                line-height: 1.5;
+                color: #ffd591;
+                background: rgba(250, 140, 22, 0.12);
+                border: 1px solid rgba(250, 140, 22, 0.24);
+                border-radius: 6px;
+                padding: 6px 8px;
             }
             #yjs-auto-apply-tips {
                 font-size: 12px;
@@ -1217,29 +1572,52 @@
 
         document.head.appendChild(style);
         document.body.appendChild(panel);
+        restorePanelPosition(panel);
 
         state.panel = panel;
         state.statusNode = panel.querySelector('#yjs-auto-apply-status');
         state.logNode = panel.querySelector('#yjs-auto-apply-log');
+        state.pauseButton = panel.querySelector('#yjs-auto-apply-pause');
+        state.statNodes = {
+            successCount: panel.querySelector('#yjs-stat-success'),
+            failedCount: panel.querySelector('#yjs-stat-failed'),
+            skippedCount: panel.querySelector('#yjs-stat-skipped'),
+            currentPage: panel.querySelector('#yjs-stat-page')
+        };
 
         bindPanelControls(panel);
         installPanelDrag(panel, panel.querySelector('#yjs-auto-apply-title'));
+        resetRuntimeStats();
+        updatePauseButton();
 
-        panel.querySelector('#yjs-auto-apply-start').addEventListener('click', async () => {
+        panel.querySelector('#yjs-auto-apply-start').addEventListener('click', async (event) => {
+            flashButtonFeedback(event.currentTarget);
             syncSettingsFromPanel();
 
             if (state.running) {
+                if (state.paused) {
+                    resumeAutoApply();
+                    return;
+                }
                 log('自动投递已在运行中');
                 return;
             }
             if (!ensureSearchPage()) {
-                updateStatus('状态：请先进入搜索结果页', '#ff4d4f');
-                log('请先在应届生站内完成登录、搜索和筛选，并停留在搜索结果页');
+                updateStatus('状态：请先进入岗位列表页', '#ff4d4f');
+                log('请先在应届生站内完成登录、搜索和筛选，并停留在搜索结果页、职位推荐页或实习页');
                 return;
             }
 
+            const precheck = await runPrecheck();
+            if (precheck.filteredCandidates === 0) {
+                updateStatus('状态：预检查未发现可投递岗位', '#fa8c16');
+            }
+
+            resetRuntimeStats();
             state.running = true;
+            state.paused = false;
             updateStatus('状态：运行中', '#52c41a');
+            updatePauseButton();
             log('开始自动投递');
 
             state.loopPromise = autoApplyLoop().catch((error) => {
@@ -1248,13 +1626,28 @@
             await state.loopPromise;
         });
 
-        panel.querySelector('#yjs-auto-apply-stop').addEventListener('click', () => {
+        panel.querySelector('#yjs-auto-apply-pause').addEventListener('click', (event) => {
+            flashButtonFeedback(event.currentTarget);
+            if (!state.running) {
+                return;
+            }
+            if (state.paused) {
+                resumeAutoApply();
+                return;
+            }
+            pauseAutoApply();
+        });
+
+        panel.querySelector('#yjs-auto-apply-stop').addEventListener('click', (event) => {
+            flashButtonFeedback(event.currentTarget);
             stopAutoApply('用户手动停止');
         });
 
-        panel.querySelector('#yjs-auto-apply-clear').addEventListener('click', () => {
+        panel.querySelector('#yjs-auto-apply-clear').addEventListener('click', (event) => {
+            flashButtonFeedback(event.currentTarget);
             state.seenJobs.clear();
             state.logLines = [];
+            resetRuntimeStats();
             if (state.logNode) {
                 state.logNode.textContent = '';
             }
@@ -1269,7 +1662,7 @@
         installOpenInterceptors();
         log('脚本已加载，等待开始');
         if (!ensureSearchPage()) {
-            updateStatus('状态：当前不是搜索结果页', '#fa8c16');
+            updateStatus('状态：当前不是支持的岗位列表页', '#fa8c16');
         }
     }
 
